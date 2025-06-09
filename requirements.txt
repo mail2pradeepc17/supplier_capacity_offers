@@ -1,0 +1,4 @@
+Flask==3.0.3
+google-generativeai==0.7.1
+pandas==2.2.3
+numpy==2.1.3
