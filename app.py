@@ -35,8 +35,6 @@ logging.info(f"Loaded {len(df_offers)} offers from CSV")
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 
 def extract_locations(text):
-    """Extract location names from text (simple word matching)"""
-    # You can expand this list as needed
     known_locations = {
         'pune', 'mumbai', 'nagpur', 'nashik', 'thane', 'aurangabad',
         'delhi', 'chennai', 'bangalore', 'hyderabad', 'kolkata'
@@ -45,42 +43,70 @@ def extract_locations(text):
     return [word for word in words if word in known_locations]
 
 def extract_tonnage(text):
-    """Extract numeric tonnage from text"""
     match = re.search(r'(\d+)\s*(?:tons?|tonnage|quintals?)', text.lower())
     if match:
         return int(match.group(1))
     return None
 
-def get_gemini_match_score(query_desc, offer_desc):
-    """
-    Simulate Gemini match score using smart keyword + numeric matching
-    """
+# Match logic
+def get_gemini_match_score(query_desc, offer_desc, offer_from=None, offer_to=None):
     logging.info(f"Scoring match:\nQuery: {query_desc}\nOffer: {offer_desc}")
 
-    score = 0
-
+    base_score = 0
     q = query_desc.lower()
     o = offer_desc.lower()
 
-    # --- LOCATION MATCHING (Dynamic!) ---
+    # --- LOCATION MATCHING ---
     q_locs = extract_locations(q)
     o_locs = extract_locations(o)
 
     matched_locs = set(q_locs) & set(o_locs)
-    score += len(matched_locs) * 3  # +3 per matched location
+    base_score += len(matched_locs) * 2  # Base location match
+
+    # --- DIRECTION MATCHING ---
+    expected_from = None
+    expected_to = None
+
+    if 'from' in q.split() and 'to' in q.split():
+        from_idx = q.split().index('from')
+        to_idx = q.split().index('to')
+
+        if from_idx + 1 < len(q.split()) and to_idx + 1 < len(q.split()):
+            expected_from = q.split()[from_idx + 1]
+            expected_to = q.split()[to_idx + 1]
+
+    # Check if direction matches
+    direction_match = False
+    reverse_direction = False
+
+    if expected_from and expected_to and offer_from and offer_to:
+        expected_from = expected_from.title()
+        expected_to = expected_to.title()
+        offer_from = offer_from.title()
+        offer_to = offer_to.title()
+
+        if expected_from == offer_from and expected_to == offer_to:
+            direction_match = True
+        elif expected_from == offer_to and expected_to == offer_from:
+            reverse_direction = True
+
+    if direction_match:
+        base_score += 4  # Full bonus for matching direction
+    elif reverse_direction:
+        base_score -= 6  # Penalize reverse direction heavily
 
     # --- CAPACITY TYPE MATCHING ---
     if any(kw in q for kw in ['truck', 'transport', 'shipping']) and \
        any(kw in o for kw in ['truck', 'container', 'haul']):
-        score += 2
+        base_score += 2
 
     if any(kw in q for kw in ['storage', 'warehouse']) and \
        any(kw in o for kw in ['storage', 'warehouse']):
-        score += 2
+        base_score += 2
 
     if any(kw in q for kw in ['packaging', 'pack']) and \
        any(kw in o for kw in ['packaging', 'box', 'wrap']):
-        score += 2
+        base_score += 2
 
     # --- TONNAGE MATCHING ---
     q_ton = extract_tonnage(q)
@@ -89,20 +115,24 @@ def get_gemini_match_score(query_desc, offer_desc):
     if q_ton and o_ton:
         diff = abs(q_ton - o_ton)
         if diff == 0:
-            score += 4  # Perfect match
+            base_score += 4
         elif diff <= 5:
-            score += 3  # Close match
+            base_score += 3
         else:
-            score += 1  # At least in ballpark
+            base_score += 1
 
     # --- COMMON WORD BONUS ---
     q_words = set(re.findall(r'\b\w+\b', q))
     o_words = set(re.findall(r'\b\w+\b', o))
     common = q_words & o_words
-    score += min(len(common), 3)  # Up to +3 for keyword overlap
+    base_score += min(len(common), 3)
 
-    # Clamp score between 0 and 10
-    return max(0, min(10, score))
+    final_score = max(0, min(10, base_score))
+
+    logging.debug(f"Final score: {final_score} | Direction match: {direction_match}, Reverse: {reverse_direction}")
+    return final_score
+
+# Results display logic
 
 def run_search(query):
     logging.info(f"Running search for query: '{query}'")
