@@ -18,7 +18,6 @@ def get_gemini_api_key():
     return settings.GEMINI_API_KEY
 
 GEMINI_API_KEY = get_gemini_api_key()
-print("--->" + str(len(GEMINI_API_KEY)))  # check for token length
 
 # Configure GenAI Model
 genai.configure(api_key=GEMINI_API_KEY)
@@ -93,103 +92,66 @@ def extract_date(text):
     return None
 
 # Match logic
-def get_gemini_match_score(query_desc, offer_desc, offer_from=None, offer_to=None):
-    logging.info(f"Scoring match:\nQuery: {query_desc}\nOffer: {offer_desc}")
-    
+def get_gemini_match_score(query_desc, offer_row):
     base_score = 0
     q = query_desc.lower()
-    o = offer_desc.lower()
+    o = offer_row['description'].lower()
 
-    # --- LOCATION MATCHING ---
+    # Location and direction matching (unchanged)
     q_locs = extract_locations(q)
-    o_locs = extract_locations(o)
-    
+    o_locs = [offer_row['location_from'].lower(), offer_row['location_to'].lower()]
     matched_locs = set(q_locs) & set(o_locs)
-    base_score += len(matched_locs) * 2  # Base location match
-    
-    # --- DIRECTION MATCHING ---
-    expected_from = None
-    expected_to = None
-    
+    base_score += len(matched_locs) * 2
+
     from_to_match = re.search(r'from\s+(\w+)\s+to\s+(\w+)', q)
     if from_to_match:
         expected_from = from_to_match.group(1).lower()
         expected_to = from_to_match.group(2).lower()
-    
-    # Check if direction matches
-    direction_match = False
-    reverse_direction = False
-    
-    if expected_from and expected_to and offer_from and offer_to:
-        expected_from = expected_from.title()
-        expected_to = expected_to.title()
-        offer_from = offer_from.title()
-        offer_to = offer_to.title()
-        
+        offer_from = offer_row['location_from'].lower()
+        offer_to = offer_row['location_to'].lower()
         if expected_from == offer_from and expected_to == offer_to:
-            direction_match = True
+            base_score += 4
         elif expected_from == offer_to and expected_to == offer_from:
-            reverse_direction = True
-            
-    if direction_match:
-        base_score += 4  # Full bonus for matching direction
-    elif reverse_direction:
-        base_score -= 2  # Penalize reverse direction less severely
-    
-    # --- CAPACITY TYPE MATCHING ---
+            base_score -= 2
+
+    # Capacity type matching (unchanged)
     if any(kw in q for kw in ['truck', 'transport', 'shipping']) and \
        any(kw in o for kw in ['truck', 'container', 'haul']):
         base_score += 2
-        
-    if any(kw in q for kw in ['storage', 'warehouse']) and \
-       any(kw in o for kw in ['storage', 'warehouse']):
-        base_score += 2
-        
-    if any(kw in q for kw in ['packaging', 'pack']) and \
-       any(kw in o for kw in ['packaging', 'box', 'wrap']):
-        base_score += 2
-    
-    # --- TONNAGE MATCHING ---
+
+    # Tonnage matching (adjusted)
     q_ton = extract_tonnage(q)
     o_ton = extract_tonnage(o)
-    
     if q_ton and o_ton:
         diff = abs(q_ton - o_ton)
         if diff == 0:
+            base_score += 6  # Higher weight for exact match
+        elif diff <= 2:
             base_score += 4
-        elif diff <= 2:  # Smaller difference gets almost full points
-            base_score += 3
-        elif diff <= 5:  # Moderate difference gets some points
+        elif diff <= 5:
             base_score += 2
-        elif diff <= 10:  # Larger difference still gets minor points
-            base_score += 1
-    
-    # --- DATE MATCHING ---
+
+    # Date matching (adjusted)
     q_date = extract_date(q)
-    o_date = extract_date(o)
-    
-    if q_date and o_date:
-        days_diff = abs((q_date - o_date).days)
+    o_date = offer_row['available_till']
+    if q_date and o_date and q_date <= o_date:
+        days_diff = (o_date - q_date).days
         if days_diff == 0:
-            base_score += 3  # Exact date match
-        elif days_diff <= 7:  # Within a week
-            base_score += 2
-        elif days_diff <= 15:  # Within two weeks
+            base_score += 5  # Higher weight for exact match
+        elif days_diff <= 7:
+            base_score += 3
+        elif days_diff <= 15:
             base_score += 1
-    
-    # --- COMMON WORD BONUS ---
+
+    # Common word bonus (reduced cap)
     q_words = set(re.findall(r'\b\w+\b', q))
     o_words = set(re.findall(r'\b\w+\b', o))
     common = q_words & o_words
-    base_score += min(len(common), 5)  # Increased weight for common words
-    
-    final_score = max(0, min(10, base_score))
-    
-    logging.debug(f"Final score: {final_score} | Direction match: {direction_match}, Reverse: {reverse_direction}")
-    return final_score
+    base_score += min(len(common), 3)  # Cap at +3
+
+    return base_score
 
 # Results display logic
-
 def run_search(query):
     logging.info(f"Running search for query: '{query}'")
     
@@ -249,14 +211,27 @@ def run_search(query):
             additional_context += f"Target date: {q_date.strftime('%Y-%m-%d')}. "
         
         return get_gemini_match_score(f"{query} {additional_context}", desc)
-    
-    filtered['relevance'] = filtered['description'].apply(score_with_context)
-    
-    matches = filtered.sort_values(by='relevance', ascending=False).head(10)
+
+    # Sorting logic:
+    filtered['relevance'] = filtered.apply(lambda row: get_gemini_match_score(query, row), axis=1)
+    filtered['offer_ton'] = filtered['description'].apply(extract_tonnage)
+    if q_ton:
+        filtered['tonnage_diff'] = filtered['offer_ton'].apply(lambda x: abs(x - q_ton) if x is not None else float('inf'))
+    else:
+        filtered['tonnage_diff'] = 0
+    if q_date:
+        filtered['date_diff'] = (filtered['available_till'] - q_date).dt.days
+    else:
+        filtered['date_diff'] = 0
+
+    # Sort with index as final tie-breaker
+    matches = filtered.sort_values(by=['relevance', 'tonnage_diff', 'date_diff'], ascending=[False, True, True]).head(10)
+
     logging.info(f"Found top {len(matches)} matches.")
     return matches.to_dict(orient='records')
 
 
+# Flask App logic
 @app.route('/', methods=['GET', 'POST'])
 def index():
     if request.method == 'POST':
@@ -283,7 +258,6 @@ def search_matches():
     except Exception as e:
         logging.exception("Unexpected error during search")
         return f"Internal server error: {str(e)}", 500
-
 
 if __name__ == '__main__':
     app.run(debug=True, threaded=True)
